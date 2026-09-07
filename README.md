@@ -10,6 +10,12 @@
 -->
 # dsh-anima-tags
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-anima-tags"><img src="https://img.shields.io/badge/version-0.1.1-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 封装 danbooru-tags.exe 为 DSH 工具面（硬锚点校验/随机抽卡/批量），支撑 Anima 生图 prompt 组装
 
 ## 生态
