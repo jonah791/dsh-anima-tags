@@ -15,13 +15,23 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import {
   buildQueryArgs, buildRandomArgs, cliError, parseTagsOutput, timeoutMessage,
   type TagQueryArgs, type TagRandomArgs, type TagsRunResult,
 } from './pure.ts'
+import {
+  animaTagsTrace, buildStamp, describeQueryKind, readPackageVersion, redactQuery,
+  summarizeTagsResult, truncate,
+  type TagsRunMeta, type TraceQueryArgs,
+} from './trace.ts'
 
 export const name = 'anima-tags'
 export const inject = ['tools'] as const
+
+const OWN_FILE = fileURLToPath(import.meta.url)
+/** 进程级构建自报 `<version>@<模块 mtime ms>`（Q1：线上跑的是哪个构建）。 */
+const BUILD = buildStamp(OWN_FILE, readPackageVersion(OWN_FILE))
 
 export interface Config {
   /** danbooru-tags.exe 可执行文件绝对路径 */
@@ -36,8 +46,10 @@ export const Config = z.object({
 })
 
 /** 调用 danbooru-tags，返回解析后的 JSON（stdout 首 JSON 对象/数组）。
- * 决策在 src/pure.ts（参数拼装 / 容错解析 / 错误归口，均可离线单测）；这里只做子进程 IO。 */
-function runTags(config: Config, args: string[], timeoutMs?: number): Promise<TagsRunResult> {
+ * 决策在 src/pure.ts（参数拼装 / 容错解析 / 错误归口，均可离线单测）；这里只做子进程 IO。
+ *  `meta` 是**纯观测出口**（调用方传入即被填充）：Q3 要能区分「超时」与「CLI 报错」、
+ *  Q5 要能对照预算，而这些只在定时器/回调里可得，故在此收口填出，不改变任何业务分支。 */
+function runTags(config: Config, args: string[], timeoutMs: number | undefined, meta: TagsRunMeta): Promise<TagsRunResult> {
   return new Promise((resolve) => {
     const child = spawn(config.tagsBin, args, {
       windowsHide: true,
@@ -47,12 +59,15 @@ function runTags(config: Config, args: string[], timeoutMs?: number): Promise<Ta
     let stderr = ''
     const timer = setTimeout(() => {
       child.kill()
+      meta.timedOut = true
       resolve({ ok: false, data: null, raw: '', stderr: timeoutMessage(timeoutMs ?? config.timeoutMs) })
     }, timeoutMs ?? config.timeoutMs)
     child.stdout.on('data', (d: Buffer) => { stdout += d.toString('utf8') })
     child.stderr.on('data', (d: Buffer) => { stderr += d.toString('utf8') })
     child.on('close', (code) => {
       clearTimeout(timer)
+      // 超时分支已 resolve，此处不再覆写观测出口（否则「超时」会被后到的 close 伪装成「退出码 0」）
+      if (!meta.timedOut) meta.exitCode = typeof code === 'number' ? code : -1
       const parsed = parseTagsOutput(stdout, code)
       resolve({ ok: parsed.ok, data: parsed.data, raw: parsed.raw, stderr: stderr.trim() })
     })
@@ -65,6 +80,46 @@ function runTags(config: Config, args: string[], timeoutMs?: number): Promise<Ta
 
 export function apply(ctx: Context, config: Config): void {
   const logger = ctx.logger('dsh-anima-tags')
+
+  /**
+   * 两个工具执行体的**唯一收口**：调 CLI → `cliError` 归口 → 落一行轨迹。
+   * 单点落笔（可维护性纪律 5）：新增工具必须经此，否则会悄悄制造新的观测盲区。
+   * 业务返回形状**逐字保持原实现**（`{ok:false,result:null,error}` / `{ok:true,result:data}`）；
+   * 业务异常原样重抛（观测层不吞业务错），但先记一笔失败轨迹。
+   */
+  async function runTool(
+    phase: 'query' | 'random',
+    op: string,
+    args: TraceQueryArgs,
+    cliArgs: string[],
+  ): Promise<{ ok: boolean; result: TagsRunResult['data']; error?: string }> {
+    const meta: TagsRunMeta = { exitCode: -1, timedOut: false }
+    const startedAtMs = Date.now()
+    let r: TagsRunResult | undefined
+    let thrown: unknown = null
+    try {
+      r = await runTags(config, cliArgs, undefined, meta)
+    } catch (err) {
+      thrown = err
+    }
+    const err = thrown !== null
+      ? '抛错: ' + (thrown instanceof Error ? thrown.message : String(thrown))
+      : cliError(r as TagsRunResult)
+    const summary = summarizeTagsResult(r?.data)
+    const { kind, value } = describeQueryKind(args, phase)
+    animaTagsTrace({
+      phase, build: BUILD, op, bin: config.tagsBin,
+      queryKind: kind, query: truncate(redactQuery(value)),
+      matchMode: args.matchMode ?? '', budgetMs: config.timeoutMs,
+      hitCount: summary.hitCount, matchLayers: summary.matchLayers,
+      exitCode: meta.exitCode, durationMs: Date.now() - startedAtMs,
+      ok: err === null, timedOut: meta.timedOut,
+      ...(err !== null ? { error: err } : {}),
+    })
+    if (thrown !== null) throw thrown
+    if (err !== null) return { ok: false, result: null, error: err }
+    return { ok: true, result: (r as TagsRunResult).data }
+  }
 
   // ---------- anima_tag：标签查询/校验 ----------
   ctx.tools.register(defineTool({
@@ -94,10 +149,7 @@ export function apply(ctx: Context, config: Config): void {
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? 'tag：' + JSON.stringify(v.result).slice(0, 300) : 'tag 查询失败：' + String(v.error ?? '').slice(0, 100) }],
     },
     async execute(args: TagQueryArgs) {
-      const r = await runTags(config, buildQueryArgs(args))
-      const err = cliError(r)
-      if (err !== null) return { ok: false, result: null, error: err }
-      return { ok: true, result: r.data }
+      return runTool('query', 'anima_tag', args, buildQueryArgs(args))
     },
   }))
 
@@ -124,14 +176,17 @@ export function apply(ctx: Context, config: Config): void {
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '随机：' + JSON.stringify(v.result).slice(0, 300) : '随机失败：' + String(v.error ?? '').slice(0, 100) }],
     },
     async execute(args: TagRandomArgs) {
-      const r = await runTags(config, buildRandomArgs(args))
-      const err = cliError(r)
-      if (err !== null) return { ok: false, result: null, error: err }
-      return { ok: true, result: r.data }
+      return runTool('random', 'anima_tag_random', args, buildRandomArgs(args))
     },
   }))
 
   ctx.effect(() => {
+    // 进程级构建自报（Q1）：boot 行用中性值填充，字段与调用行完全同形（tail 后可直接读列）。
+    animaTagsTrace({
+      phase: 'boot', build: BUILD, op: 'apply', bin: config.tagsBin,
+      queryKind: 'none', query: '', matchMode: '', budgetMs: config.timeoutMs,
+      hitCount: 0, matchLayers: [], exitCode: -1, durationMs: 0, ok: true, timedOut: false,
+    })
     logger.info('ready（danbooru-tags 检索面：2 工具；tagsBin=' + config.tagsBin + '）')
     return () => { /* 清理 */ }
   })
