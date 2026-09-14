@@ -137,19 +137,23 @@ dsh-anima-tags · apply(ctx, config)
 |---|-----------|------------------------------|------|
 | A1 | 工具面恰为 2 个（`anima_tag`、`anima_tag_random`） | 会话工具列表 `anima_tag` 前缀命中 2；源码 `ctx.tools.register` 计数 = 2 | 已实测（源码计数） |
 | A2 | 精确校验可用 | `anima_tag keyword=1girl matchMode=exact` → `ok:true` 且命中 canonical tag | **待验收** |
-| A3 | 空参数不进 argv（I4） | 传 `keyword:''`/`group:''` → 不产生 `-k ''`/`-g ''`（等价于不传，返回与不传相同） | **待验收** |
-| A4 | 无 CLI 即失败（I2） | 临时把 `tagsBin` 指向不存在路径 → 返回 `'无法启动 danbooru-tags：…'`，**不是**空成功 | **待验收** |
-| A5 | 超时必杀（I3） | `timeoutMs` 调到极小值 → 返回超时错误且子进程不残留（任务管理器无该 PID） | **待验收** |
-| A6 | 当前进程加载最新构建 | lib mtime `2026-08-21 13:45:38` < web PID 7080 启动 `2026-09-14 10:05:47` | 已实测（2026-09-14 读数） |
+| A3 | 空参数不进 argv（I4） | `npm test` → `buildQueryArgs: 空参数全部不传——只留 -j`（空串/纯空白/undefined 三类）+ `边界——数值 0 是合法参数` | 已实测（2026-09-14，离线的 I4 机器版） |
+| A4 | 无 CLI 即失败（I2） | 临时把 `tagsBin` 指向不存在路径 → 返回 `'无法启动 danbooru-tags：…'`，**不是**空成功 | **待验收**（需进程级；其错误归口已由 `cliError` 三级回落用例覆盖） |
+| A5 | 超时必杀（I3） | `timeoutMs` 调到极小值 → 返回超时错误且子进程不残留（任务管理器无该 PID） | **待验收**（需进程级；超时文案由 `timeoutMessage` 用例钉住） |
+| A6 | 当前进程加载最新构建 | lib mtime `2026-08-21 13:45:38` < web PID 7080 启动 `2026-09-14 10:05:47` | 已实测（2026-09-14 读数；本次补课重建后需重新部署核对） |
 | A7 | 挂载行与 tagsBin 唯一 | `grep -n "dsh-anima-tags" cordis.patch.yml` → 1 命中（行 159）；`tagsBin` 行 161 | 已实测 |
 | A8 | 包描述与实际工具面一致 | `package.json.description` 称「硬锚点校验/随机抽卡/**批量**」，实际无批量工具 → 命题：**描述含未实现能力**（§8） | 已实测（不一致，登记为缺口） |
+| A9 | 参数 → CLI flag 映射逐条可验（含顺序） | `npm test` → `buildQueryArgs` / `buildRandomArgs` 7 条用例（§4.2 的映射表变成断言） | 已实测（2026-09-14） |
+| A10 | stdout 容错解析：BOM / 前置日志行 / 对象优先 / 半截 JSON | `npm test` → `parseTagsOutput` 6 条用例 | 已实测（2026-09-14） |
+| A11 | 错误归口三级回落（data.error → stderr → raw → 兜底）+ 500 字截断 | `npm test` → `cliError` 3 条用例 | 已实测（2026-09-14） |
+| A12 | 失败/退化路径被机器锁住（S6 判据） | `npm test` → 17/17 pass，含空参/非零退出/半截 JSON/BOM/quirk 各失败面 | 已实测（2026-09-14） |
 
 ## 8 · 与实现的关系
 
-- 主实现：`self-plugins/dsh-anima-tags/src/index.ts`（唯一文件，无同语义副本）。
+- 主实现：`self-plugins/dsh-anima-tags/src/index.ts`（IO 接线：spawn / 超时 / 工具注册）**+ `src/pure.ts`（纯逻辑层：`buildQueryArgs` / `buildRandomArgs` / `parseTagsOutput` / `cliError` / `timeoutMessage`）**；两者无同语义副本。产物 `lib/index.js` + `lib/pure.js`。测试：`tests/pure.test.mjs`（17 例）。
 - 未实现/未验证部分**显式标注**：
   - **描述漂移（已实测）**：`package.json` description 与 `README.md` 公约声明写「批量」，但工具面只有查询与随机抽卡 2 个，**无批量工具**（批量可由 `limit`/`prefix` 部分替代，但语义不等价）。本文件只登记，不改源码/README。
-  - **无单测**：仓库内无 `tests/`，A2–A5 无自动化证据。
+  - 无单测文件（仓库内无 `tests/`），A2–A5 无自动化证据。**已部分闭环（2026-09-14）**：现有 17 例离线回归覆盖参数映射 / 容错解析 / 错误归口（A9–A12），A2/A4/A5 仍是进程级验收。
   - **无自证侧车**：`ctx.logger` 不落盘 → 「装载成功/CLI 实际 argv/耗时」事后不可查（依据 §5.22，属可维护性缺口，见 U3）。
   - 索引更新机制不在本仓库：`danbooru-tags.exe` 的 sqlite 如何更新**未在本插件内定义**（U2）。
 
@@ -160,9 +164,17 @@ dsh-anima-tags · apply(ctx, config)
   - 语义**被补充**：组合挂载点（patch 行 157–161，`tagsBin` 绝对路径）、消费方技能 `comfyui-guidance`（行 49/272）、「数据源 = 29MB sqlite 索引」这一事实。
   - 语义**被修正**：无（此前无文档）；但登记了 description「批量」与实际工具面不一致。
   - 教训（同时回写技能 `semantic-doc-first`）：**「透传型插件」的语义重心在 CLI 契约与失败归口**——不写清「退出码 0 但无 JSON / 非 0 但有 JSON」这两条边界，排障时会反复误判。
+- **2026-09-14 · 可维护性补课（S3 有测试 / S6 失败路径）：抽纯逻辑层 + 17 例回归；§4.2 映射表变断言**
+  - **抽层（行为不变的搬家）**：新增 `src/pure.ts` —— `buildQueryArgs`（原 `anima_tag.execute` 里 12 行 `if (args.x !== undefined && args.x.trim() !== '')` 拼装）/ `buildRandomArgs`（原 `-j -r <count>` 那三行）/ `parseTagsOutput`（原 `close` 回调里的 trim+BOM+整体 JSON+截块解析）/ `cliError`（原模块级函数）/ `timeoutMessage`。`index.ts` 只留 spawn / 定时器 / 工具注册。`runTags` 的返回类型由匿名结构改为导出的 `TagsRunResult`（**形状不变**）。
+  - **语义被确认（并升级为断言）**：§4.2 的参数 → flag 映射表此前只是文档，现在逐条有测试；空串/纯空白/undefined 一律不进 argv；`minCount: 0` / `limit: 0` 是合法参数（不得按 falsy 丢弃）；`count` 缺省 1；开关必须严格 `true`。
+  - **语义被补充（新不变量）**：`ok` 判定口径 `code === 0 || data !== null` 的**两个方向**都要被钉住——① 非 0 退出但携 JSON → 判成功；② **退出 0 但输出不可解析 → 也判成功**（`result:null`，`cliError` 返回 null）＝**假成功**。②已用「文档化 quirk」用例锁住并登记 §10 U1，**本次不改行为**（宽松口径是既有设计取舍，改它需要一次真实反例验证）。
+  - **行为变更：无**（逐条比对：参数数组、解析分支、错误文案、500 字截断、超时文案全部逐字一致）。
+  - **教训**：透传型插件的可测性红利最大——参数映射与输出解析是**纯字符串进出**，一次抽取就换来了 17 例秒级回归，把「CLI 换了输出格式」这类事故从「线上才发现」提前到「改完就红」。
 
 ## 10 · 未决问题
 
 - **U1 `ok` 判定口径**：`ok = code === 0 || data !== null`——非 0 退出但有 JSON 时算成功，没有把「退出码」与「数据」分开暴露。是否改为返回 `{exitCode, data}` 两字段由调用方裁决？倾向：保持宽松（CLI 的告警走 JSON 内 `error` 字段），但需一次真实反例验证。
 - **U2 索引新鲜度**：sqlite 索引随 exe 分发，**何时更新、谁负责更新**未定义；词表落后会导致「新角色标签查不到」被误读为工具故障。倾向：在 `anima_tag` 输出里带索引版本/日期（若 CLI 支持），否则在 README 写明更新流程。
 - **U3 可维护性缺口**：无落盘轨迹 → 「CLI 实际 argv / 耗时 / 断点」事后不可查（§5.22 五问中三问答不了）。倾向：补 `<DSH_HOME>/anima-tags-trace.jsonl`（吞错、一行一调用），但需主人确认是否要新增落盘面。
+- **U4（新，2026-09-14）「假成功」路径**：退出码 0 + 输出不可解析 → 工具返回 `{ok:true, result:null}`（`cliError` 也判成功），调用方拿到 null 会以为「查无结果」。判据已由 quirk 用例钉住。倾向修法：`ok` 改为 `data !== null`（或 `code === 0 && data !== null`）——**属行为变更**，需一次真实反例（CLI 换输出格式/静默 exit 0）后再定调。与 U1 同一处取舍。
+- **U5（新，2026-09-14）超时错误丢弃已收集的 stdout/stderr**：超时分支只返回 `'超时（Nms）'`，CLI 挂起前打印的线索（如「loading index…」）被丢掉，定位「卡在哪一步」缺证据。倾向：把 `stdout/stderr` 尾部各 200 字拼进超时文案（属行为变更，需定调）。

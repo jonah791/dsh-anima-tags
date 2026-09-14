@@ -15,6 +15,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { spawn } from 'node:child_process'
+import {
+  buildQueryArgs, buildRandomArgs, cliError, parseTagsOutput, timeoutMessage,
+  type TagQueryArgs, type TagRandomArgs, type TagsRunResult,
+} from './pure.ts'
 
 export const name = 'anima-tags'
 export const inject = ['tools'] as const
@@ -31,8 +35,9 @@ export const Config = z.object({
   timeoutMs: z.number().default(30000),
 })
 
-/** 调用 danbooru-tags，返回解析后的 JSON（stdout 首 JSON 对象/数组） */
-function runTags(config: Config, args: string[], timeoutMs?: number): Promise<{ ok: boolean; data: any; raw: string; stderr: string }> {
+/** 调用 danbooru-tags，返回解析后的 JSON（stdout 首 JSON 对象/数组）。
+ * 决策在 src/pure.ts（参数拼装 / 容错解析 / 错误归口，均可离线单测）；这里只做子进程 IO。 */
+function runTags(config: Config, args: string[], timeoutMs?: number): Promise<TagsRunResult> {
   return new Promise((resolve) => {
     const child = spawn(config.tagsBin, args, {
       windowsHide: true,
@@ -42,41 +47,20 @@ function runTags(config: Config, args: string[], timeoutMs?: number): Promise<{ 
     let stderr = ''
     const timer = setTimeout(() => {
       child.kill()
-      resolve({ ok: false, data: null, raw: '', stderr: 'danbooru-tags 超时（' + (timeoutMs ?? config.timeoutMs) + 'ms）' })
+      resolve({ ok: false, data: null, raw: '', stderr: timeoutMessage(timeoutMs ?? config.timeoutMs) })
     }, timeoutMs ?? config.timeoutMs)
     child.stdout.on('data', (d: Buffer) => { stdout += d.toString('utf8') })
     child.stderr.on('data', (d: Buffer) => { stderr += d.toString('utf8') })
     child.on('close', (code) => {
       clearTimeout(timer)
-      const trimmed = stdout.trim().replace(/^\uFEFF/, '')
-      let data: any = null
-      try {
-        data = JSON.parse(trimmed)
-      } catch {
-        const objMatch = trimmed.match(/\{[\s\S]*\}/)
-        const arrMatch = trimmed.match(/\[[\s\S]*\]/)
-        const block = objMatch ?? arrMatch
-        if (block !== null) {
-          try { data = JSON.parse(block[0]) } catch { data = null }
-        }
-      }
-      resolve({ ok: code === 0 || data !== null, data, raw: trimmed, stderr: stderr.trim() })
+      const parsed = parseTagsOutput(stdout, code)
+      resolve({ ok: parsed.ok, data: parsed.data, raw: parsed.raw, stderr: stderr.trim() })
     })
     child.on('error', (err) => {
       clearTimeout(timer)
       resolve({ ok: false, data: null, raw: '', stderr: '无法启动 danbooru-tags：' + err.message })
     })
   })
-}
-
-/** 从 CLI 结果构建统一错误信息 */
-function cliError(r: { ok: boolean; data: any; raw: string; stderr: string }): string | null {
-  if (r.ok) return null
-  const d = r.data as { error?: string } | null
-  if (d !== null && typeof d === 'object' && d.error !== undefined) {
-    return JSON.stringify(d.error)
-  }
-  return (r.stderr || r.raw || 'danbooru-tags 执行失败').slice(0, 500)
 }
 
 export function apply(ctx: Context, config: Config): void {
@@ -109,19 +93,8 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? 'tag：' + JSON.stringify(v.result).slice(0, 300) : 'tag 查询失败：' + String(v.error ?? '').slice(0, 100) }],
     },
-    async execute(args: { keyword?: string; prefix?: string; group?: string; category?: string; matchMode?: string; minCount?: number; limit?: number; forPrompt?: boolean; compact?: boolean; extended?: boolean }) {
-      const cliArgs = ['-j']
-      if (args.keyword !== undefined && args.keyword.trim() !== '') cliArgs.push('-k', args.keyword.trim())
-      if (args.prefix !== undefined && args.prefix.trim() !== '') cliArgs.push('-p', args.prefix.trim())
-      if (args.group !== undefined && args.group.trim() !== '') cliArgs.push('-g', args.group.trim())
-      if (args.category !== undefined && args.category.trim() !== '') cliArgs.push('-c', args.category.trim())
-      if (args.matchMode !== undefined && args.matchMode.trim() !== '') cliArgs.push('--match-mode', args.matchMode.trim())
-      if (args.minCount !== undefined) cliArgs.push('-m', String(args.minCount))
-      if (args.limit !== undefined) cliArgs.push('-l', String(args.limit))
-      if (args.forPrompt === true) cliArgs.push('--for-prompt')
-      if (args.compact === true) cliArgs.push('--compact')
-      if (args.extended === true) cliArgs.push('-e')
-      const r = await runTags(config, cliArgs)
+    async execute(args: TagQueryArgs) {
+      const r = await runTags(config, buildQueryArgs(args))
       const err = cliError(r)
       if (err !== null) return { ok: false, result: null, error: err }
       return { ok: true, result: r.data }
@@ -150,13 +123,8 @@ export function apply(ctx: Context, config: Config): void {
       },
       render: (_a: unknown, v: any) => [{ type: 'text', text: v.ok ? '随机：' + JSON.stringify(v.result).slice(0, 300) : '随机失败：' + String(v.error ?? '').slice(0, 100) }],
     },
-    async execute(args: { count?: number; group?: string; limit?: number; forPrompt?: boolean; extended?: boolean }) {
-      const cliArgs = ['-j', '-r', String(args.count ?? 1)]
-      if (args.group !== undefined && args.group.trim() !== '') cliArgs.push('-g', args.group.trim())
-      if (args.limit !== undefined) cliArgs.push('-l', String(args.limit))
-      if (args.forPrompt === true) cliArgs.push('--for-prompt')
-      if (args.extended === true) cliArgs.push('-e')
-      const r = await runTags(config, cliArgs)
+    async execute(args: TagRandomArgs) {
+      const r = await runTags(config, buildRandomArgs(args))
       const err = cliError(r)
       if (err !== null) return { ok: false, result: null, error: err }
       return { ok: true, result: r.data }
